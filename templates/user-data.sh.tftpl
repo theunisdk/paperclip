@@ -1,0 +1,212 @@
+#!/bin/bash
+# Paperclip + OpenClaw EC2 bootstrap script
+# This runs as root via cloud-init on first boot.
+# Logs: /var/log/paperclip-setup.log
+set -euo pipefail
+exec > /var/log/paperclip-setup.log 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+export HOME=/home/ubuntu
+USER=ubuntu
+
+echo "=== [1/9] System packages ==="
+apt-get update
+apt-get install -y curl git python3 jq build-essential
+
+echo "=== [2/9] OS hardening ==="
+
+# --- SSH hardening ---
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
+sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
+sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 3/' /etc/ssh/sshd_config
+systemctl restart sshd
+
+# --- UFW firewall ---
+apt-get install -y ufw
+ufw default deny incoming
+ufw default allow outgoing
+# Allow Tailscale interface
+ufw allow in on tailscale0
+# Allow SSH fallback from public interface (if key pair provided)
+ufw allow 22/tcp
+ufw --force enable
+
+# --- fail2ban ---
+apt-get install -y fail2ban
+cat > /etc/fail2ban/jail.local << 'JAIL'
+[sshd]
+enabled = true
+port = ssh
+filter = sshd
+logpath = /var/log/auth.log
+maxretry = 3
+bantime = 3600
+findtime = 600
+JAIL
+systemctl enable fail2ban
+systemctl start fail2ban
+
+# --- Kernel hardening ---
+cat > /etc/sysctl.d/99-hardening.conf << 'SYSCTL'
+# Allow Tailscale IP forwarding
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+# Ignore ICMP redirects
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+# Ignore send redirects
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+# Enable SYN flood protection
+net.ipv4.tcp_syncookies = 1
+# Log martian packets
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+# Ignore ICMP broadcast requests
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+# Disable source routing
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+SYSCTL
+sysctl -p /etc/sysctl.d/99-hardening.conf
+
+# --- Automatic security updates ---
+apt-get install -y unattended-upgrades
+cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AUTOUPDATE'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+AUTOUPDATE
+
+echo "=== [3/9] Tailscale ==="
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up --authkey="${tailscale_auth_key}" --hostname="${tailscale_hostname}" --ssh
+
+echo "=== [4/9] Node.js 24 ==="
+curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+apt-get install -y nodejs
+
+# Enable user lingering so systemd user services survive logout
+loginctl enable-linger ubuntu
+
+echo "=== [5/9] Install Paperclip + OpenClaw + Claude Code ==="
+su - ubuntu << 'USERSCRIPT'
+set -euo pipefail
+
+mkdir -p ~/paperclip-server
+cd ~/paperclip-server
+npm init -y
+npm install paperclipai@latest
+npm install drizzle-orm@0.45.1   # Workaround: better-auth requires >=0.41.0, paperclip bundles 0.38.4
+
+sudo npm install -g openclaw@latest
+sudo npm install -g @anthropic-ai/claude-code
+USERSCRIPT
+
+echo "=== [6/9] Configure Paperclip ==="
+su - ubuntu << 'USERSCRIPT'
+set -euo pipefail
+
+cd ~/paperclip-server
+npx paperclipai onboard --yes
+
+# Patch config for remote access
+python3 -c "
+import json
+cfg_path = '/home/ubuntu/.paperclip/instances/default/config.json'
+with open(cfg_path) as f:
+    cfg = json.load(f)
+cfg['server']['deploymentMode'] = 'authenticated'
+cfg['server']['host'] = '0.0.0.0'
+cfg['server']['exposure'] = 'private'
+with open(cfg_path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
+
+BETTER_AUTH_SECRET=$(openssl rand -hex 32)
+AGENT_JWT_SECRET=$(openssl rand -hex 32)
+
+cat > ~/.paperclip/instances/default/.env << EOF
+PAPERCLIP_AGENT_JWT_SECRET=$AGENT_JWT_SECRET
+BETTER_AUTH_SECRET=$BETTER_AUTH_SECRET
+EOF
+USERSCRIPT
+
+echo "=== [7/9] Configure OpenClaw default instance ==="
+su - ubuntu << USERSCRIPT
+set -euo pipefail
+
+openclaw onboard \
+  --non-interactive \
+  --accept-risk \
+  --auth-choice apiKey \
+  --anthropic-api-key "${anthropic_api_key}" \
+  --gateway-bind loopback \
+  --gateway-auth token \
+  --gateway-token "${paperclip_gateway_token}" \
+  --gateway-port 18789 \
+  --workspace ~/.openclaw/workspace \
+  --skip-channels \
+  --skip-skills \
+  --skip-search \
+  --skip-ui \
+  --no-install-daemon
+USERSCRIPT
+
+echo "=== [8/9] Create CEO workspace and skills ==="
+su - ubuntu << USERSCRIPT
+set -euo pipefail
+
+mkdir -p ~/paperclip-workspaces/ceo/.claude/skills/spawn-openclaw-agent
+
+# CEO context file
+cat > ~/paperclip-workspaces/ceo/CLAUDE.md << 'CLAUDEEOF'
+${ceo_claude_md}
+CLAUDEEOF
+
+# Spawn skill
+cat > ~/paperclip-workspaces/ceo/.claude/skills/spawn-openclaw-agent/SKILL.md << 'SKILLEOF'
+${spawn_skill_md}
+SKILLEOF
+
+# Port registry
+cat > ~/paperclip-workspaces/openclaw-registry.json << REGISTRYEOF
+{
+  "instances": [],
+  "sharedToken": "${paperclip_gateway_token}",
+  "basePort": 18800,
+  "workspacesRoot": "/home/ubuntu/paperclip-workspaces"
+}
+REGISTRYEOF
+USERSCRIPT
+
+echo "=== [9/9] Create systemd service ==="
+su - ubuntu << 'USERSCRIPT'
+set -euo pipefail
+
+mkdir -p ~/.config/systemd/user
+
+cat > ~/.config/systemd/user/paperclip.service << 'SERVICE'
+[Unit]
+Description=Paperclip AI Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/paperclip-server
+ExecStart=/usr/bin/node /home/ubuntu/paperclip-server/node_modules/.bin/paperclipai run
+Restart=on-failure
+RestartSec=5
+Environment=PATH=/usr/local/bin:/usr/bin:/home/ubuntu/.local/bin
+
+[Install]
+WantedBy=default.target
+SERVICE
+
+systemctl --user daemon-reload
+systemctl --user enable paperclip
+systemctl --user start paperclip
+USERSCRIPT
+
+echo "=== Setup complete at $(date) ==="

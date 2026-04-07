@@ -1,0 +1,16 @@
+# Required
+anthropic_api_key  = "sk-ant-..."
+tailscale_auth_key = "tskey-auth-..."   # Generate at https://login.tailscale.com/admin/settings/keys
+
+# Optional
+# tailscale_hostname      = "paperclip"    # How the instance appears on your tailnet
+# aws_region              = "us-east-1"
+# instance_type           = "t3.xlarge"    # t3.2xlarge for 8+ agents
+# volume_size             = 50
+# paperclip_gateway_token = ""             # Auto-generated if empty
+# openclaw_agent_count    = 4
+# project_name            = "paperclip"
+
+# SSH fallback (optional — not needed if using Tailscale exclusively)
+# ssh_key_name  = "my-key-pair"
+# allowed_cidr  = "203.0.113.5/32"
