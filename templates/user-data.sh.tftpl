@@ -201,7 +201,8 @@ REGISTRYEOF
 chown -R ubuntu:ubuntu /home/ubuntu/paperclip-workspaces
 
 echo "=== [9/9] Create systemd service ==="
-su - ubuntu << 'USERSCRIPT'
+PAPERCLIP_HOSTNAME="${tailscale_hostname}"
+su - ubuntu << USERSCRIPT
 set -euo pipefail
 
 mkdir -p ~/.config/systemd/user
@@ -226,6 +227,17 @@ SERVICE
 systemctl --user daemon-reload
 systemctl --user enable paperclip
 systemctl --user start paperclip
+
+# Wait for server to be ready, then generate bootstrap invite
+for i in $(seq 1 30); do
+  if curl -sf http://127.0.0.1:3100/api/health > /dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+
+cd ~/paperclip-server
+npx paperclipai auth bootstrap-ceo --base-url "http://${tailscale_hostname}:3100" 2>&1 || true
 USERSCRIPT
 
 echo "=== Setup complete at $(date) ==="
