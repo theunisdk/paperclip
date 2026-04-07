@@ -88,7 +88,7 @@ resource "aws_route_table_association" "public" {
 
 resource "aws_security_group" "main" {
   name_prefix = "${var.project_name}-"
-  description = "Paperclip server — Tailscale handles access, SG is minimal"
+  description = "Paperclip server - Tailscale handles access, SG is minimal"
   vpc_id      = aws_vpc.main.id
 
   # SSH fallback — only if key pair and CIDR are provided
@@ -133,7 +133,7 @@ resource "aws_instance" "main" {
     delete_on_termination = false
   }
 
-  user_data = base64encode(templatefile("${path.module}/templates/user-data.sh.tftpl", {
+  user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
     anthropic_api_key       = var.anthropic_api_key
     paperclip_gateway_token = local.gateway_token
     openclaw_agent_count    = var.openclaw_agent_count
@@ -141,7 +141,8 @@ resource "aws_instance" "main" {
     tailscale_hostname      = var.tailscale_hostname
     ceo_claude_md           = file("${path.module}/templates/ceo-claude.md")
     spawn_skill_md          = file("${path.module}/templates/spawn-openclaw-agent-skill.md")
-  }))
+  })
+
 
   metadata_options {
     http_endpoint = "enabled"

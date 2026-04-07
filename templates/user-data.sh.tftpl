@@ -20,7 +20,7 @@ sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
 sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/' /etc/ssh/sshd_config
 sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 3/' /etc/ssh/sshd_config
-systemctl restart sshd
+systemctl restart ssh
 
 # --- UFW firewall ---
 apt-get install -y ufw
@@ -109,9 +109,25 @@ su - ubuntu << 'USERSCRIPT'
 set -euo pipefail
 
 cd ~/paperclip-server
-npx paperclipai onboard --yes
 
-# Patch config for remote access
+# onboard --yes starts the server and blocks, so run in background and wait for config
+npx paperclipai onboard --yes &
+ONBOARD_PID=$!
+
+# Wait for config file to appear (means onboard + DB init finished)
+for i in $(seq 1 60); do
+  if [ -f ~/.paperclip/instances/default/config.json ]; then
+    sleep 5  # Give it a moment to finish writing
+    break
+  fi
+  sleep 2
+done
+
+kill $ONBOARD_PID 2>/dev/null || true
+wait $ONBOARD_PID 2>/dev/null || true
+sleep 2
+
+# Patch config for remote/tailscale access
 python3 -c "
 import json
 cfg_path = '/home/ubuntu/.paperclip/instances/default/config.json'
@@ -120,6 +136,7 @@ with open(cfg_path) as f:
 cfg['server']['deploymentMode'] = 'authenticated'
 cfg['server']['host'] = '0.0.0.0'
 cfg['server']['exposure'] = 'private'
+cfg['server']['allowedHostnames'] = ['${tailscale_hostname}']
 with open(cfg_path, 'w') as f:
     json.dump(cfg, f, indent=2)
 "
@@ -151,27 +168,28 @@ openclaw onboard \
   --skip-skills \
   --skip-search \
   --skip-ui \
-  --no-install-daemon
+  --no-install-daemon \
+  --skip-health
 USERSCRIPT
 
 echo "=== [8/9] Create CEO workspace and skills ==="
-su - ubuntu << USERSCRIPT
+su - ubuntu << 'USERSCRIPT'
 set -euo pipefail
-
 mkdir -p ~/paperclip-workspaces/ceo/.claude/skills/spawn-openclaw-agent
+USERSCRIPT
 
-# CEO context file
-cat > ~/paperclip-workspaces/ceo/CLAUDE.md << 'CLAUDEEOF'
+# Write CEO context file (as root, then chown)
+cat > /home/ubuntu/paperclip-workspaces/ceo/CLAUDE.md << 'CLAUDEEOF'
 ${ceo_claude_md}
 CLAUDEEOF
 
-# Spawn skill
-cat > ~/paperclip-workspaces/ceo/.claude/skills/spawn-openclaw-agent/SKILL.md << 'SKILLEOF'
+# Write spawn skill
+cat > /home/ubuntu/paperclip-workspaces/ceo/.claude/skills/spawn-openclaw-agent/SKILL.md << 'SKILLEOF'
 ${spawn_skill_md}
 SKILLEOF
 
-# Port registry
-cat > ~/paperclip-workspaces/openclaw-registry.json << REGISTRYEOF
+# Write port registry (needs Terraform variable for token)
+cat > /home/ubuntu/paperclip-workspaces/openclaw-registry.json << REGISTRYEOF
 {
   "instances": [],
   "sharedToken": "${paperclip_gateway_token}",
@@ -179,7 +197,8 @@ cat > ~/paperclip-workspaces/openclaw-registry.json << REGISTRYEOF
   "workspacesRoot": "/home/ubuntu/paperclip-workspaces"
 }
 REGISTRYEOF
-USERSCRIPT
+
+chown -R ubuntu:ubuntu /home/ubuntu/paperclip-workspaces
 
 echo "=== [9/9] Create systemd service ==="
 su - ubuntu << 'USERSCRIPT'
