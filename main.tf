@@ -131,6 +131,10 @@ resource "aws_instance" "main" {
     volume_type           = "gp3"
     encrypted             = true
     delete_on_termination = false
+    tags = {
+      Name    = "${var.project_name}-root"
+      Project = var.project_name
+    }
   }
 
   user_data = templatefile("${path.module}/templates/user-data.sh.tftpl", {
